@@ -522,25 +522,28 @@ fn gen_new_array(
     elements: &Vec<InsnId>,
     state: &FrameState,
 ) -> lir::Opnd {
-    asm_comment!(asm, "call rb_ary_new");
 
-    // Save PC
     gen_save_pc(asm, state);
 
-    let length: ::std::os::raw::c_long = elements.len().try_into().expect("Unable to fit length of elements into c_long");
+    for i in (0..elements.len()).rev() {
+        let insn_id = elements.get(i as usize)
+            .expect("Element should exist at index");
+        let val = jit.get_opnd(*insn_id).unwrap();
+        asm.cpush(val);
+    }
 
+    let length: ::std::os::raw::c_long = elements.len().try_into()
+        .expect("Unable to fit length of elements into c_long");
+    let sp = asm.c_stack_top();
+
+    asm_comment!(asm, "call rb_ec_ary_new_from_values");
     let new_array = asm.ccall(
-        rb_ary_new_capa as *const u8,
-        vec![lir::Opnd::Imm(length)],
+        rb_ec_ary_new_from_values as *const u8,
+        vec![EC, Opnd::Imm(length), sp],
     );
 
-    for i in 0..elements.len() {
-        let insn_id = elements.get(i as usize).expect("Element should exist at index");
-        let val = jit.get_opnd(*insn_id).unwrap();
-        asm.ccall(
-            rb_ary_push as *const u8,
-            vec![new_array, val]
-        );
+    for _ in 0..elements.len() {
+        _ = asm.cpop();
     }
 
     new_array

@@ -344,6 +344,9 @@ pub enum Insn {
     /// Push all of the caller-save registers and the flags to the C stack
     CPushAll,
 
+    // Retrieve the stack pointer per the architecture.
+    CStackTop(Opnd),
+
     // C function call with N arguments (variadic)
     CCall {
         opnds: Vec<Opnd>,
@@ -566,6 +569,7 @@ impl Insn {
             Insn::CPopInto(_) => "CPopInto",
             Insn::CPush(_) => "CPush",
             Insn::CPushAll => "CPushAll",
+            Insn::CStackTop(_) => "CStackTop",
             Insn::CCall { .. } => "CCall",
             Insn::CRet(_) => "CRet",
             Insn::CSelE { .. } => "CSelE",
@@ -624,6 +628,7 @@ impl Insn {
         match self {
             Insn::Add { out, .. } |
             Insn::And { out, .. } |
+            Insn::CStackTop(out) |
             Insn::CCall { out, .. } |
             Insn::CPop { out, .. } |
             Insn::CSelE { out, .. } |
@@ -657,6 +662,7 @@ impl Insn {
         match self {
             Insn::Add { out, .. } |
             Insn::And { out, .. } |
+            Insn::CStackTop(out) |
             Insn::CCall { out, .. } |
             Insn::CPop { out, .. } |
             Insn::CSelE { out, .. } |
@@ -734,6 +740,7 @@ impl<'a> Iterator for InsnOpndIterator<'a> {
             Insn::BakeString(_) |
             Insn::Breakpoint |
             Insn::Comment(_) |
+            Insn::CStackTop(_) |
             Insn::CPop { .. } |
             Insn::CPopAll |
             Insn::CPushAll |
@@ -848,6 +855,7 @@ impl<'a> InsnOpndMutIterator<'a> {
             Insn::BakeString(_) |
             Insn::Breakpoint |
             Insn::Comment(_) |
+            Insn::CStackTop(_) |
             Insn::CPop { .. } |
             Insn::CPopAll |
             Insn::CPushAll |
@@ -1800,6 +1808,12 @@ impl Assembler {
     }
     */
 
+    pub fn c_stack_top(&mut self) -> Opnd {
+        let out = self.new_vreg(Opnd::DEFAULT_NUM_BITS);
+        self.push_insn(Insn::CStackTop(out));
+        out
+    }
+
     pub fn cmp(&mut self, left: Opnd, right: Opnd) {
         self.push_insn(Insn::Cmp { left, right });
     }
@@ -2143,4 +2157,3 @@ mod tests {
         assert!(matches!(opnd_iter.next(), None));
     }
 }
-

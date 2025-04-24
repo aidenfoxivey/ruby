@@ -484,6 +484,9 @@ impl Assembler
                     iterator.next_unmapped(); // Pop merged jump instruction
                 }
                 */
+                Insn::CStackTop( out ) => {
+                    asm.push_insn(insn);
+                }
                 Insn::CCall { opnds, .. } => {
                     assert!(opnds.len() <= C_ARG_OPNDS.len());
 
@@ -921,6 +924,9 @@ impl Assembler
                     for _ in 0..(4 - ((text.len() + 1) % 4)) {
                         cb.write_byte(0);
                     }
+                },
+                Insn::CStackTop(opnd) => {
+                    mov(cb, opnd.into(), C_SP_REG);
                 },
                 Insn::FrameSetup => {
                     stp_pre(cb, X29, X30, A64Opnd::new_mem(128, C_SP_REG, -16));
