@@ -113,6 +113,13 @@ pub enum Invariant {
         /// The method ID of the method we want to assume unchanged
         method: ID,
     },
+    /// A list of constant expression path segments that must have not been written to for the
+    /// following code to be valid.
+    StableConstantNames {
+        idlist: *const ID,
+    },
+    /// There is one ractor running. If a non-root ractor gets spawned, this is invalidated.
+    SingleRactorMode,
 }
 
 impl Invariant {
@@ -161,6 +168,22 @@ impl<'a> std::fmt::Display for InvariantPrinter<'a> {
                     self.ptr_map.map_id(method.0)
                 )
             }
+            Invariant::StableConstantNames { idlist } => {
+                write!(f, "StableConstantNames({:p}, ", self.ptr_map.map_ptr(idlist))?;
+                let mut idx = 0;
+                let mut sep = "";
+                loop {
+                    let id = unsafe { *idlist.wrapping_add(idx) };
+                    if id.0 == 0 {
+                        break;
+                    }
+                    write!(f, "{sep}{}", id.contents_lossy())?;
+                    sep = "::";
+                    idx += 1;
+                }
+                write!(f, ")")
+            }
+            Invariant::SingleRactorMode => write!(f, "SingleRactorMode"),
         }
     }
 }
@@ -292,7 +315,7 @@ pub enum Insn {
     // with IfTrue/IfFalse in the backend to generate jcc.
     Test { val: InsnId },
     Defined { op_type: usize, obj: VALUE, pushval: VALUE, v: InsnId },
-    GetConstantPath { ic: *const u8 },
+    GetConstantPath { ic: *const iseq_inline_constant_cache },
 
     //NewObject?
     //SetIvar {},
@@ -596,7 +619,7 @@ impl<T: Copy + Into<usize> + PartialEq> UnionFind<T> {
     }
 
     /// Find the set representative for `insn` without doing path compression.
-    pub fn find_const(&self, insn: T) -> T {
+    fn find_const(&self, insn: T) -> T {
         let mut result = insn;
         loop {
             match self.at(result) {
@@ -622,7 +645,7 @@ pub struct Function {
     // TODO: get method name and source location from the ISEQ
 
     insns: Vec<Insn>,
-    union_find: UnionFind<InsnId>,
+    union_find: std::cell::RefCell<UnionFind<InsnId>>,
     insn_types: Vec<Type>,
     blocks: Vec<Block>,
     entry_block: BlockId,
@@ -634,7 +657,7 @@ impl Function {
             iseq,
             insns: vec![],
             insn_types: vec![],
-            union_find: UnionFind::new(),
+            union_find: UnionFind::new().into(),
             blocks: vec![Block::default()],
             entry_block: BlockId(0),
         }
@@ -643,8 +666,12 @@ impl Function {
     // Add an instruction to the function without adding it to any block
     fn new_insn(&mut self, insn: Insn) -> InsnId {
         let id = InsnId(self.insns.len());
+        if insn.has_output() {
+            self.insn_types.push(types::Any);
+        } else {
+            self.insn_types.push(types::Empty);
+        }
         self.insns.push(insn);
-        self.insn_types.push(types::Empty);
         id
     }
 
@@ -713,15 +740,25 @@ impl Function {
         macro_rules! find {
             ( $x:expr ) => {
                 {
-                    self.union_find.find_const($x)
+                    self.union_find.borrow_mut().find($x)
                 }
             };
         }
-        let insn_id = self.union_find.find_const(insn_id);
+        macro_rules! find_branch_edge {
+            ( $edge:ident ) => {
+                {
+                    BranchEdge {
+                        target: $edge.target,
+                        args: $edge.args.iter().map(|x| find!(*x)).collect(),
+                    }
+                }
+            };
+        }
+        let insn_id = self.union_find.borrow_mut().find(insn_id);
         use Insn::*;
         match &self.insns[insn_id.0] {
             result@(PutSelf | Const {..} | Param {..} | NewArray {..} | GetConstantPath {..}
-                    | Jump(_) | PatchPoint {..}) => result.clone(),
+                    | PatchPoint {..}) => result.clone(),
             Snapshot { state: FrameState { iseq, insn_idx, pc, stack, locals } } =>
                 Snapshot {
                     state: FrameState {
@@ -736,8 +773,9 @@ impl Function {
             StringCopy { val } => StringCopy { val: find!(*val) },
             StringIntern { val } => StringIntern { val: find!(*val) },
             Test { val } => Test { val: find!(*val) },
-            IfTrue { val, target } => IfTrue { val: find!(*val), target: target.clone() },
-            IfFalse { val, target } => IfFalse { val: find!(*val), target: target.clone() },
+            Jump(target) => Jump(find_branch_edge!(target)),
+            IfTrue { val, target } => IfTrue { val: find!(*val), target: find_branch_edge!(target) },
+            IfFalse { val, target } => IfFalse { val: find!(*val), target: find_branch_edge!(target) },
             GuardType { val, guard_type, state } => GuardType { val: find!(*val), guard_type: *guard_type, state: *state },
             GuardBitEquals { val, expected, state } => GuardBitEquals { val: find!(*val), expected: *expected, state: *state },
             FixnumAdd { left, right, state } => FixnumAdd { left: find!(*left), right: find!(*right), state: *state },
@@ -784,12 +822,12 @@ impl Function {
     /// Replace `insn` with the new instruction `replacement`, which will get appended to `insns`.
     fn make_equal_to(&mut self, insn: InsnId, replacement: InsnId) {
         // Don't push it to the block
-        self.union_find.make_equal_to(insn, replacement);
+        self.union_find.borrow_mut().make_equal_to(insn, replacement);
     }
 
     fn type_of(&self, insn: InsnId) -> Type {
         assert!(self.insns[insn.0].has_output());
-        self.insn_types[self.union_find.find_const(insn).0]
+        self.insn_types[self.union_find.borrow_mut().find(insn).0]
     }
 
     /// Check if the type of `insn` is a subtype of `ty`.
@@ -1012,6 +1050,25 @@ impl Function {
                         }
                         let send_direct = self.push_insn(block, Insn::SendWithoutBlockDirect { self_val, call_info, cd, iseq, args, state });
                         self.make_equal_to(insn_id, send_direct);
+                    }
+                    Insn::GetConstantPath { ic } => {
+                        let idlist: *const ID = unsafe { (*ic).segments };
+                        let ice = unsafe { (*ic).entry };
+                        if ice.is_null() {
+                            self.push_insn_id(block, insn_id); continue;
+                        }
+                        let cref_sensitive = !unsafe { (*ice).ic_cref }.is_null();
+                        let multi_ractor_mode = unsafe { rb_zjit_multi_ractor_p() };
+                        if cref_sensitive || multi_ractor_mode {
+                            self.push_insn_id(block, insn_id); continue;
+                        }
+                        // Assume single-ractor mode.
+                        self.push_insn(block, Insn::PatchPoint(Invariant::SingleRactorMode));
+                        // Invalidate output code on any constant writes associated with constants
+                        // referenced after the PatchPoint.
+                        self.push_insn(block, Insn::PatchPoint(Invariant::StableConstantNames { idlist }));
+                        let replacement = self.push_insn(block, Insn::Const { val: Const::Value(unsafe { (*ice).value }) });
+                        self.make_equal_to(insn_id, replacement);
                     }
                     _ => { self.push_insn_id(block, insn_id); }
                 }
@@ -1410,7 +1467,7 @@ impl<'a> std::fmt::Display for FunctionPrinter<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FrameState {
     iseq: IseqPtr,
     insn_idx: usize,
@@ -1543,6 +1600,10 @@ fn compute_jump_targets(iseq: *const rb_iseq_t) -> Vec<u32> {
                 let offset = get_arg(pc, 0).as_i64();
                 jump_targets.insert(insn_idx_at_offset(insn_idx, offset));
             }
+            YARVINSN_opt_new => {
+                let offset = get_arg(pc, 1).as_i64();
+                jump_targets.insert(insn_idx_at_offset(insn_idx, offset));
+            }
             YARVINSN_leave | YARVINSN_opt_invokebuiltin_delegate_leave => {
                 if insn_idx < iseq_size {
                     jump_targets.insert(insn_idx);
@@ -1556,10 +1617,26 @@ fn compute_jump_targets(iseq: *const rb_iseq_t) -> Vec<u32> {
     result
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
+pub enum CallType {
+    Splat,
+    BlockArg,
+    Kwarg,
+    KwSplat,
+    Tailcall,
+    Super,
+    Zsuper,
+    OptSend,
+    KwSplatMut,
+    SplatMut,
+    Forwarding,
+}
+
+#[derive(Debug, PartialEq)]
 pub enum ParseError {
     StackUnderflow(FrameState),
     UnknownOpcode(String),
+    UnhandledCallType(CallType),
 }
 
 fn num_lead_params(iseq: *const rb_iseq_t) -> usize {
@@ -1571,6 +1648,22 @@ fn num_lead_params(iseq: *const rb_iseq_t) -> usize {
 /// Return the number of locals in the current ISEQ (includes parameters)
 fn num_locals(iseq: *const rb_iseq_t) -> usize {
     (unsafe { get_iseq_body_local_table_size(iseq) }) as usize
+}
+
+/// If we can't handle the type of send (yet), bail out.
+fn filter_translatable_calls(flag: u32) -> Result<(), ParseError> {
+    if (flag & VM_CALL_KW_SPLAT_MUT) != 0 { return Err(ParseError::UnhandledCallType(CallType::KwSplatMut)); }
+    if (flag & VM_CALL_ARGS_SPLAT_MUT) != 0 { return Err(ParseError::UnhandledCallType(CallType::SplatMut)); }
+    if (flag & VM_CALL_ARGS_SPLAT) != 0 { return Err(ParseError::UnhandledCallType(CallType::Splat)); }
+    if (flag & VM_CALL_KW_SPLAT) != 0 { return Err(ParseError::UnhandledCallType(CallType::KwSplat)); }
+    if (flag & VM_CALL_ARGS_BLOCKARG) != 0 { return Err(ParseError::UnhandledCallType(CallType::BlockArg)); }
+    if (flag & VM_CALL_KWARG) != 0 { return Err(ParseError::UnhandledCallType(CallType::Kwarg)); }
+    if (flag & VM_CALL_TAILCALL) != 0 { return Err(ParseError::UnhandledCallType(CallType::Tailcall)); }
+    if (flag & VM_CALL_SUPER) != 0 { return Err(ParseError::UnhandledCallType(CallType::Super)); }
+    if (flag & VM_CALL_ZSUPER) != 0 { return Err(ParseError::UnhandledCallType(CallType::Zsuper)); }
+    if (flag & VM_CALL_OPT_SEND) != 0 { return Err(ParseError::UnhandledCallType(CallType::OptSend)); }
+    if (flag & VM_CALL_FORWARDING) != 0 { return Err(ParseError::UnhandledCallType(CallType::Forwarding)); }
+    Ok(())
 }
 
 /// Compile ISEQ into High-level IR
@@ -1682,7 +1775,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     state.stack_push(fun.push_insn(block, Insn::Defined { op_type, obj, pushval, v }));
                 }
                 YARVINSN_opt_getconstant_path => {
-                    let ic = get_arg(pc, 0).as_ptr::<u8>();
+                    let ic = get_arg(pc, 0).as_ptr();
                     state.stack_push(fun.push_insn(block, Insn::GetConstantPath { ic }));
                 }
                 YARVINSN_branchunless => {
@@ -1710,6 +1803,17 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                         target: BranchEdge { target, args: state.as_args() }
                     });
                     queue.push_back((state.clone(), target, target_idx));
+                }
+                YARVINSN_opt_new => {
+                    let offset = get_arg(pc, 1).as_i64();
+                    // TODO(max): Check interrupts
+                    let target_idx = insn_idx_at_offset(insn_idx, offset);
+                    let target = insn_idx_to_block[&target_idx];
+                    // Skip the fast-path and go straight to the fallback code. We will let the
+                    // optimizer take care of the converting Class#new->alloc+initialize instead.
+                    fun.push_insn(block, Insn::Jump(BranchEdge { target, args: state.as_args() }));
+                    queue.push_back((state.clone(), target, target_idx));
+                    break;  // Don't enqueue the next block as a successor
                 }
                 YARVINSN_jump => {
                     let offset = get_arg(pc, 0).as_i64();
@@ -1757,6 +1861,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     // NB: opt_neq has two cd; get_arg(0) is for eq and get_arg(1) is for neq
                     let cd: *const rb_call_data = get_arg(pc, 1).as_ptr();
                     let call_info = unsafe { rb_get_call_data_ci(cd) };
+                    filter_translatable_calls(unsafe { rb_vm_ci_flag(call_info) })?;
                     let argc = unsafe { vm_ci_argc((*cd).ci) };
 
 
@@ -1797,6 +1902,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                 YARVINSN_opt_send_without_block => {
                     let cd: *const rb_call_data = get_arg(pc, 0).as_ptr();
                     let call_info = unsafe { rb_get_call_data_ci(cd) };
+                    filter_translatable_calls(unsafe { rb_vm_ci_flag(call_info) })?;
                     let argc = unsafe { vm_ci_argc((*cd).ci) };
 
 
@@ -1819,6 +1925,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     let cd: *const rb_call_data = get_arg(pc, 0).as_ptr();
                     let blockiseq: IseqPtr = get_arg(pc, 1).as_iseq();
                     let call_info = unsafe { rb_get_call_data_ci(cd) };
+                    filter_translatable_calls(unsafe { rb_vm_ci_flag(call_info) })?;
                     let argc = unsafe { vm_ci_argc((*cd).ci) };
 
                     let method_name = unsafe {
@@ -1871,19 +1978,19 @@ mod union_find_tests {
     }
 
     #[test]
-    fn test_find_const_returns_target() {
+    fn test_find_returns_target() {
         let mut uf = UnionFind::new();
         uf.make_equal_to(3, 4);
-        assert_eq!(uf.find_const(3usize), 4);
+        assert_eq!(uf.find(3usize), 4);
     }
 
     #[test]
-    fn test_find_const_returns_transitive_target() {
+    fn test_find_returns_transitive_target() {
         let mut uf = UnionFind::new();
         uf.make_equal_to(3, 4);
         uf.make_equal_to(4, 5);
-        assert_eq!(uf.find_const(3usize), 5);
-        assert_eq!(uf.find_const(4usize), 5);
+        assert_eq!(uf.find(3usize), 5);
+        assert_eq!(uf.find(4usize), 5);
     }
 
     #[test]
@@ -2133,6 +2240,16 @@ mod tests {
         let actual_hir = format!("{}", FunctionPrinter::without_snapshot(&function));
         expected_hir.assert_eq(&actual_hir);
     }
+
+    #[track_caller]
+    fn assert_compile_fails(method: &str, reason: ParseError) {
+        let iseq = crate::cruby::with_rubyvm(|| get_method_iseq(method));
+        unsafe { crate::cruby::rb_zjit_profile_disable(iseq) };
+        let result = iseq_to_hir(iseq);
+        assert!(result.is_err(), "Expected an error but succesfully compiled to HIR");
+        assert_eq!(result.unwrap_err(), reason);
+    }
+
 
     #[test]
     fn test_putobject() {
@@ -2610,6 +2727,110 @@ mod tests {
               Return v13
         "#]]);
     }
+
+    #[test]
+    fn test_cant_compile_splat() {
+        eval("
+            def test(a) = foo(*a)
+        ");
+        assert_compile_fails("test", ParseError::UnknownOpcode("splatarray".into()))
+    }
+
+    #[test]
+    fn test_cant_compile_block_arg() {
+        eval("
+            def test(a) = foo(&a)
+        ");
+        assert_compile_fails("test", ParseError::UnhandledCallType(CallType::BlockArg))
+    }
+
+    #[test]
+    fn test_cant_compile_kwarg() {
+        eval("
+            def test(a) = foo(a: 1)
+        ");
+        assert_compile_fails("test", ParseError::UnhandledCallType(CallType::Kwarg))
+    }
+
+    #[test]
+    fn test_cant_compile_kw_splat() {
+        eval("
+            def test(a) = foo(**a)
+        ");
+        assert_compile_fails("test", ParseError::UnhandledCallType(CallType::KwSplat))
+    }
+
+    // TODO(max): Figure out how to generate a call with TAILCALL flag
+
+    #[test]
+    fn test_cant_compile_super() {
+        eval("
+            def test = super()
+        ");
+        assert_compile_fails("test", ParseError::UnknownOpcode("invokesuper".into()))
+    }
+
+    #[test]
+    fn test_cant_compile_zsuper() {
+        eval("
+            def test = super
+        ");
+        assert_compile_fails("test", ParseError::UnknownOpcode("invokesuper".into()))
+    }
+
+    #[test]
+    fn test_cant_compile_super_forward() {
+        eval("
+            def test(...) = super(...)
+        ");
+        assert_compile_fails("test", ParseError::UnknownOpcode("invokesuperforward".into()))
+    }
+
+    // TODO(max): Figure out how to generate a call with OPT_SEND flag
+
+    #[test]
+    fn test_cant_compile_kw_splat_mut() {
+        eval("
+            def test(a) = foo **a, b: 1
+        ");
+        assert_compile_fails("test", ParseError::UnknownOpcode("putspecialobject".into()))
+    }
+
+    #[test]
+    fn test_cant_compile_splat_mut() {
+        eval("
+            def test(*) = foo *, 1
+        ");
+        assert_compile_fails("test", ParseError::UnknownOpcode("splatarray".into()))
+    }
+
+    #[test]
+    fn test_cant_compile_forwarding() {
+        eval("
+            def test(...) = foo(...)
+        ");
+        assert_compile_fails("test", ParseError::UnknownOpcode("sendforward".into()))
+    }
+
+    #[test]
+    fn test_opt_new() {
+        eval("
+            class C; end
+            def test = C.new
+        ");
+        assert_method_hir("test",  expect![[r#"
+            fn test:
+            bb0():
+              v1:BasicObject = GetConstantPath 0x1000
+              v2:NilClassExact = Const Value(nil)
+              Jump bb1(v2, v1)
+            bb1(v4:NilClassExact, v5:BasicObject):
+              v8:BasicObject = SendWithoutBlock v5, :new
+              Jump bb2(v8, v4)
+            bb2(v10:BasicObject, v11:NilClassExact):
+              Return v10
+        "#]]);
+    }
 }
 
 #[cfg(test)]
@@ -2683,8 +2904,8 @@ mod opt_tests {
             bb0():
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_PLUS)
               PatchPoint BOPRedefined(INTEGER_REDEFINED_OP_FLAG, BOP_PLUS)
-              v14:Fixnum[6] = Const Value(6)
-              Return v14
+              v15:Fixnum[6] = Const Value(6)
+              Return v15
         "#]]);
     }
 
@@ -3434,6 +3655,123 @@ mod opt_tests {
               PatchPoint MethodRedefined(String@0x1008, bytesize@0x1010)
               v7:Fixnum = CCall bytesize@0x1018, v2
               Return v7
+        "#]]);
+    }
+
+    #[test]
+    fn dont_replace_get_constant_path_with_empty_ic() {
+        eval("
+            def test = Kernel
+        ");
+        assert_optimized_method_hir("test", expect![[r#"
+            fn test:
+            bb0():
+              v1:BasicObject = GetConstantPath 0x1000
+              Return v1
+        "#]]);
+    }
+
+    #[test]
+    fn dont_replace_get_constant_path_with_invalidated_ic() {
+        eval("
+            def test = Kernel
+            test
+            Kernel = 5
+        ");
+        assert_optimized_method_hir("test", expect![[r#"
+            fn test:
+            bb0():
+              v1:BasicObject = GetConstantPath 0x1000
+              Return v1
+        "#]]);
+    }
+
+    #[test]
+    fn replace_get_constant_path_with_const() {
+        eval("
+            def test = Kernel
+            test
+        ");
+        assert_optimized_method_hir("test", expect![[r#"
+            fn test:
+            bb0():
+              PatchPoint SingleRactorMode
+              PatchPoint StableConstantNames(0x1000, Kernel)
+              v5:BasicObject[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+              Return v5
+        "#]]);
+    }
+
+    #[test]
+    fn replace_nested_get_constant_path_with_const() {
+        eval("
+            module Foo
+              module Bar
+                class C
+                end
+              end
+            end
+            def test = Foo::Bar::C
+            test
+        ");
+        assert_optimized_method_hir("test", expect![[r#"
+            fn test:
+            bb0():
+              PatchPoint SingleRactorMode
+              PatchPoint StableConstantNames(0x1000, Foo::Bar::C)
+              v5:BasicObject[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+              Return v5
+        "#]]);
+    }
+
+    #[test]
+    fn test_opt_new_no_initialize() {
+        eval("
+            class C; end
+            def test = C.new
+            test
+        ");
+        assert_optimized_method_hir("test",  expect![[r#"
+            fn test:
+            bb0():
+              PatchPoint SingleRactorMode
+              PatchPoint StableConstantNames(0x1000, C)
+              v16:BasicObject[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+              v2:NilClassExact = Const Value(nil)
+              Jump bb1(v2, v16)
+            bb1(v4:NilClassExact, v5:BasicObject[VALUE(0x1008)]):
+              v8:BasicObject = SendWithoutBlock v5, :new
+              Jump bb2(v8, v4)
+            bb2(v10:BasicObject, v11:NilClassExact):
+              Return v10
+        "#]]);
+    }
+
+    #[test]
+    fn test_opt_new_initialize() {
+        eval("
+            class C
+              def initialize x
+                @x = x
+              end
+            end
+            def test = C.new 1
+            test
+        ");
+        assert_optimized_method_hir("test",  expect![[r#"
+            fn test:
+            bb0():
+              PatchPoint SingleRactorMode
+              PatchPoint StableConstantNames(0x1000, C)
+              v18:BasicObject[VALUE(0x1008)] = Const Value(VALUE(0x1008))
+              v2:NilClassExact = Const Value(nil)
+              v3:Fixnum[1] = Const Value(1)
+              Jump bb1(v2, v18, v3)
+            bb1(v5:NilClassExact, v6:BasicObject[VALUE(0x1008)], v7:Fixnum[1]):
+              v10:BasicObject = SendWithoutBlock v6, :new, v7
+              Jump bb2(v10, v5)
+            bb2(v12:BasicObject, v13:NilClassExact):
+              Return v12
         "#]]);
     }
 }

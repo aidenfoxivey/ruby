@@ -45,6 +45,7 @@
 #include "ruby_atomic.h"
 #include "vm_core.h"
 #include "ractor_core.h"
+#include "ruby/internal/attr/nonstring.h"
 
 #ifdef NEED_RUBY_ATOMIC_OPS
 rb_atomic_t
@@ -853,6 +854,7 @@ check_stack_overflow(int sig, const uintptr_t addr, const ucontext_t *ctx)
              * otherwise it can cause stack overflow again at the same
              * place. */
             if ((crit = (!ec->tag->prev || !--uplevel)) != FALSE) break;
+            rb_vm_tag_jmpbuf_deinit(&ec->tag->buf);
             ec->tag = ec->tag->prev;
         }
         reset_sigmask(sig);
@@ -975,7 +977,7 @@ check_reserved_signal_(const char *name, size_t name_len, int signo)
     if (prev) {
         ssize_t RB_UNUSED_VAR(err);
         static const int stderr_fd = 2;
-#define NOZ(name, str) name[sizeof(str)-1] = str
+#define NOZ(name, str) RBIMPL_ATTR_NONSTRING() name[sizeof(str)-1] = str
         static const char NOZ(msg1, " received in ");
         static const char NOZ(msg2, " handler\n");
 

@@ -47,6 +47,7 @@ fn main() {
 
         // Our C file for glue code
         .header(src_root.join("yjit.c").to_str().unwrap())
+        .header(src_root.join("jit.c").to_str().unwrap())
 
         // Don't want to copy over C comment
         .generate_comments(false)
@@ -389,6 +390,8 @@ fn main() {
         // From internal/object.h
         .allowlist_function("rb_class_allocate_instance")
         .allowlist_function("rb_obj_equal")
+        .allowlist_function("rb_class_new_instance_pass_kw")
+        .allowlist_function("rb_obj_alloc")
 
         // From gc.h and internal/gc.h
         .allowlist_function("rb_obj_info")

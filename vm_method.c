@@ -125,7 +125,7 @@ vm_cme_invalidate(rb_callable_method_entry_t *cme)
 }
 
 static int
-rb_clear_constant_cache_for_id_i(st_data_t ic, st_data_t idx, st_data_t arg)
+rb_clear_constant_cache_for_id_i(st_data_t ic, st_data_t arg)
 {
     ((IC) ic)->entry = NULL;
     return ST_CONTINUE;
@@ -141,8 +141,8 @@ rb_clear_constant_cache_for_id(ID id)
     rb_vm_t *vm = GET_VM();
 
     if (rb_id_table_lookup(vm->constant_cache, id, &lookup_result)) {
-        st_table *ics = (st_table *)lookup_result;
-        st_foreach(ics, rb_clear_constant_cache_for_id_i, (st_data_t) NULL);
+        set_table *ics = (set_table *)lookup_result;
+        set_foreach(ics, rb_clear_constant_cache_for_id_i, (st_data_t) NULL);
         ruby_vm_constant_cache_invalidations += ics->num_entries;
     }
 
@@ -1371,7 +1371,6 @@ prepare_callable_method_entry(VALUE defined_class, ID id, const rb_method_entry_
         if (me->defined_class == 0) {
             RB_DEBUG_COUNTER_INC(mc_cme_complement);
             VM_ASSERT_TYPE2(defined_class, T_ICLASS, T_MODULE);
-            VM_ASSERT(me->defined_class == 0, "me->defined_class: %s", rb_obj_info(me->defined_class));
 
             mtbl = RCLASS_CALLABLE_M_TBL(defined_class);
 

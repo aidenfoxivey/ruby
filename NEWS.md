@@ -25,6 +25,11 @@ Note: We're only listing outstanding class updates.
     * `IO.select` accepts +Float::INFINITY+ as a timeout argument.
       [[Feature #20610]]
 
+* Set
+
+    * Set is now a core class, instead of an autoloaded stdlib class.
+      [[Feature #21216]]
+
 * String
 
     * Update Unicode to Version 16.0.0 and Emoji Version 16.0. [[Feature #19908]][[Feature #20724]]
@@ -58,12 +63,12 @@ The following default gems are updated.
 * RubyGems 3.7.0.dev
 * bundler 2.7.0.dev
 * cgi 0.4.2
-* json 2.11.2
+* json 2.11.3
 * optparse 0.7.0.dev.2
 * prism 1.4.0
-* psych 5.2.3
+* psych 5.2.4
 * stringio 3.1.8.dev
-* strscan 3.1.4.dev
+* strscan 3.1.5.dev
 * uri 1.0.3
 
 The following bundled gems are added.
@@ -74,7 +79,7 @@ The following bundled gems are updated.
 * minitest 5.25.5
 * test-unit 3.6.8
 * rexml 3.4.1
-* net-imap 0.5.7
+* net-imap 0.5.8
 * net-smtp 0.5.1
 * rbs 3.9.2
 * bigdecimal 3.1.9
@@ -98,3 +103,4 @@ The following bundled gems are updated.
 [Feature #20724]: https://bugs.ruby-lang.org/issues/20724
 [Feature #21047]: https://bugs.ruby-lang.org/issues/21047
 [Bug #21049]:     https://bugs.ruby-lang.org/issues/21049
+[Feature #21216]: https://bugs.ruby-lang.org/issues/21216
